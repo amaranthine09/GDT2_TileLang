@@ -27,7 +27,8 @@ from torch import nn
 
 from .backward import chunk_gdn2_bwd
 from .config import DEFAULT_KERNEL_CONFIG, GDN2Config, GatedDeltaNet2Config
-from .forward import _pad_to_chunk, chunk_gdn2_fwd, gdn2_decode_step
+from .forward import _pad_to_chunk, chunk_gdn2_fwd
+from .inference import gdn2_decode
 from .reference import chunk_gdn2_bwd_torch, chunk_gdn2_torch
 
 __all__ = ["gdn2_attention", "GatedDeltaNet2", "GDN2Cache", "resolve_backend"]
@@ -199,9 +200,19 @@ class _ShortConv(nn.Module):
 
     def step(self, x: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """One token. ``x``: ``[B, C]``, ``state``: ``[B, C, kernel_size - 1]``."""
-        buf = torch.cat([state, x.unsqueeze(-1)], dim=-1)  # [B, C, K]
-        y = (buf * self.conv.weight.squeeze(1)).sum(-1) + self.conv.bias
-        return (F.silu(y) if self.activation else y), buf[..., 1:]
+        y, state = self.decode(x.unsqueeze(1), state)
+        return y[:, 0], state
+
+    def decode(self, x: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``n`` tokens at once. ``x``: ``[B, n, C]``.
+
+        Prepends the cached ``kernel_size - 1`` tail so the first token sees the
+        same window it would have during a full forward pass.
+        """
+        buf = torch.cat([state, x.transpose(1, 2)], dim=-1)  # [B, C, K-1+n]
+        y = F.conv1d(buf, self.conv.weight, self.conv.bias, groups=self.channels)
+        y = y.transpose(1, 2)
+        return (F.silu(y) if self.activation else y), buf[..., -(self.kernel_size - 1):]
 
 
 class _GatedRMSNorm(nn.Module):
@@ -346,17 +357,26 @@ class GatedDeltaNet2(nn.Module):
         return out, new_cache
 
     @torch.no_grad()
-    def step(self, hidden_states: torch.Tensor, cache: GDN2Cache) -> tuple[torch.Tensor, GDN2Cache]:
-        """Decode a single token, updating ``cache`` in place.
+    def decode(self, hidden_states: torch.Tensor, cache: GDN2Cache) -> tuple[torch.Tensor, GDN2Cache]:
+        """Decode ``n`` tokens, updating ``cache`` in place.
+
+        Applies the recurrence directly rather than the chunkwise form, and
+        holds the recurrent state in registers across all ``n`` steps, so the
+        state is read and written once per call instead of once per token. Pass
+        several tokens at a time whenever you have them -- speculative decoding
+        drafts, or a short prefill tail -- since the state traffic is what
+        decoding actually costs.
 
         Args:
-            hidden_states: ``[B, hidden_size]`` for one position.
-            cache: cache returned by a previous :meth:`forward` or :meth:`step`.
+            hidden_states: ``[B, n, hidden_size]``.
+            cache: cache from a previous :meth:`forward`, :meth:`decode` or
+                :meth:`init_cache`.
 
         Returns:
-            ``(output, cache)`` with ``output`` of shape ``[B, hidden_size]``.
+            ``(output, cache)`` with ``output`` of shape
+            ``[B, n, hidden_size]``.
         """
-        B = hidden_states.shape[0]
+        B, n, _ = hidden_states.shape
         H, HK = self.num_heads, self.num_kv_heads
         DK, DV = self.head_dim_k, self.head_dim_v
 
@@ -364,28 +384,42 @@ class GatedDeltaNet2(nn.Module):
         if self.q_conv is not None:
             d_qk = HK * DK
             cs = cache.conv_state
-            q, cq = self.q_conv.step(q, cs[:, :d_qk])
-            k, ck = self.k_conv.step(k, cs[:, d_qk : 2 * d_qk])
-            v, cv = self.v_conv.step(v, cs[:, 2 * d_qk :])
+            q, cq = self.q_conv.decode(q, cs[:, :d_qk])
+            k, ck = self.k_conv.decode(k, cs[:, d_qk : 2 * d_qk])
+            v, cv = self.v_conv.decode(v, cs[:, 2 * d_qk :])
             cache.conv_state = torch.cat([cq, ck, cv], dim=1)
 
-        q = F.normalize(q.view(B, HK, DK), p=2, dim=-1)
-        k = F.normalize(k.view(B, HK, DK), p=2, dim=-1)
-        v = v.view(B, H, DV)
-        g = self._gates(hidden_states, (B,))
-        b = torch.sigmoid(self.b_proj(hidden_states).view(B, HK, DK)) * self.erase_scale
-        w = torch.sigmoid(self.w_proj(hidden_states).view(B, H, DV))
+        q = F.normalize(q.view(B, n, HK, DK), p=2, dim=-1)
+        k = F.normalize(k.view(B, n, HK, DK), p=2, dim=-1)
+        v = v.view(B, n, H, DV)
+        g = self._gates(hidden_states, (B, n))
+        b = torch.sigmoid(self.b_proj(hidden_states).view(B, n, HK, DK)) * self.erase_scale
+        w = torch.sigmoid(self.w_proj(hidden_states).view(B, n, H, DV))
         q, k, b, g = (self._expand(t) for t in (q, k, b, g))
 
-        o = gdn2_decode_step(
+        o = gdn2_decode(
             q.contiguous(), k.contiguous(), v.contiguous(),
             g.contiguous(), b.contiguous(), w.contiguous(),
             cache.recurrent_state, scale=self.scale,
         )
 
-        gate = self.o_gate_proj(hidden_states).view(B, H, DV)
-        o = self.o_norm(o, gate).reshape(B, H * DV)
+        gate = self.o_gate_proj(hidden_states).view(B, n, H, DV)
+        o = self.o_norm(o, gate).reshape(B, n, H * DV)
         return self.o_proj(o), cache
+
+    @torch.no_grad()
+    def step(self, hidden_states: torch.Tensor, cache: GDN2Cache) -> tuple[torch.Tensor, GDN2Cache]:
+        """Decode a single token. Thin wrapper over :meth:`decode`.
+
+        Args:
+            hidden_states: ``[B, hidden_size]`` for one position.
+            cache: cache from a previous call.
+
+        Returns:
+            ``(output, cache)`` with ``output`` of shape ``[B, hidden_size]``.
+        """
+        out, cache = self.decode(hidden_states.unsqueeze(1), cache)
+        return out[:, 0], cache
 
     def init_cache(self, batch_size: int, device=None, dtype=torch.float32) -> GDN2Cache:
         """Allocate an empty cache for decoding from scratch."""

@@ -7,8 +7,9 @@ Module layout::
 
     config.py      what to build (model) and how to run it (kernel tiling)
     attention.py   gdn2_attention() + the GatedDeltaNet2 module   <- start here
-    forward.py     forward TileLang kernels + their driver
-    backward.py    backward TileLang kernels + their driver
+    forward.py     chunkwise TileLang kernels (training + prefill) + driver
+    backward.py    backward TileLang kernels + driver
+    inference.py   decode kernels: one token, or n tokens per launch
     reference.py   PyTorch oracles: the recurrence, the chunkwise form,
                    the staged backward. Also the CPU fallback.
 """
@@ -16,7 +17,8 @@ Module layout::
 from .attention import GDN2Cache, GatedDeltaNet2, gdn2_attention, resolve_backend
 from .backward import chunk_gdn2_bwd
 from .config import GDN2Config, GatedDeltaNet2Config
-from .forward import chunk_gdn2_fwd, gdn2_decode_step
+from .forward import chunk_gdn2_fwd
+from .inference import gdn2_decode, gdn2_decode_step
 from .reference import chunk_gdn2_bwd_torch, chunk_gdn2_torch, recurrent_gdn2
 
 __all__ = [
@@ -26,6 +28,7 @@ __all__ = [
     "GDN2Cache",
     # functional op
     "gdn2_attention",
+    "gdn2_decode",
     "gdn2_decode_step",
     "GDN2Config",
     # kernel drivers

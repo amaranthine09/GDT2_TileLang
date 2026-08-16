@@ -1,7 +1,8 @@
 """Forward pass: TileLang kernels and the driver that runs them.
 
-Seven kernels form the training-time pipeline; an eighth handles single-token
-decoding. Naming follows the maths in :mod:`gdn2.reference`.
+Seven kernels form the chunkwise pipeline used for training and prefill.
+Naming follows the maths in :mod:`gdn2.reference`. Decoding lives in
+:mod:`gdn2.inference`.
 
     1. ``cumsum_kernel``       g            -> G      (local cumsum, log2 space)
     2. ``intra_diag_kernel``   q,k,b,G      -> Aqk, Akk diagonal sub-blocks
@@ -47,7 +48,6 @@ from .config import DEFAULT_KERNEL_CONFIG, GDN2Config
 
 __all__ = [
     "chunk_gdn2_fwd",
-    "gdn2_decode_step",
     "cumsum_kernel",
     "intra_diag_kernel",
     "inter_blocks_kernel",
@@ -55,7 +55,6 @@ __all__ = [
     "wy_kernel",
     "state_kernel",
     "output_kernel",
-    "decode_step_kernel",
 ]
 
 LOG2E = 1.4426950408889634
@@ -728,99 +727,7 @@ def output_kernel(
     return kernel
 
 
-@tilelang.jit(out_idx=[-1], pass_configs=_FAST_MATH)
-def decode_step_kernel(
-    B: int,
-    H: int,
-    DK: int,
-    DV: int,
-    scale: float,
-    input_dtype: str = "bfloat16",
-    output_dtype: str = "bfloat16",
-    accum_dtype: str = "float32",
-    gate_dtype: str = "float32",
-    state_dtype: str = "float32",
-    block_DV: int = 64,
-    threads: int = 128,
-):
-    """Single-token GDN-2 update for autoregressive decoding.
 
-    Applies the recurrence directly -- no chunking, no WY form -- and updates
-    ``state`` in place::
-
-        S <- diag(exp(g)) S
-        u  = w * v - S^T (b * k)
-        S <- S + k u^T
-        o  = scale * S^T q
-
-    Args:
-        B, H, DK, DV: problem dims (one token).
-        scale: query scale.
-        input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype: dtypes.
-        block_DV: value tile per block.
-        threads: threads per block.
-
-    Returns:
-        A JIT kernel ``(q, k, v, g, b, w, state) -> o``. Inputs are
-        ``[B, H, D]``-shaped, ``state`` is ``[B, H, DK, DV]`` and is mutated.
-    """
-    k_shape = (B, H, DK)
-    v_shape = (B, H, DV)
-    st_shape = (B, H, DK, DV)
-
-    @T.prim_func
-    def kernel(
-        q: T.Tensor(k_shape, dtype=input_dtype),
-        k: T.Tensor(k_shape, dtype=input_dtype),
-        v: T.Tensor(v_shape, dtype=input_dtype),
-        g: T.Tensor(k_shape, dtype=gate_dtype),
-        b: T.Tensor(k_shape, dtype=input_dtype),
-        w: T.Tensor(v_shape, dtype=input_dtype),
-        state: T.Tensor(st_shape, dtype=state_dtype),
-        o: T.Tensor(v_shape, dtype=output_dtype),
-    ):
-        with T.Kernel(T.ceildiv(DV, block_DV), B * H, threads=threads) as (i_v, i_bh):
-            i_b, i_h = i_bh // H, i_bh % H
-            lo, hi = i_v * block_DV, (i_v + 1) * block_DV
-
-            st_f = T.alloc_fragment((DK, block_DV), dtype=accum_dtype)
-            q_s = T.alloc_shared((DK,), dtype=input_dtype, scope="shared")
-            k_s = T.alloc_shared((DK,), dtype=input_dtype, scope="shared")
-            b_s = T.alloc_shared((DK,), dtype=input_dtype, scope="shared")
-            g_s = T.alloc_shared((DK,), dtype=gate_dtype, scope="shared")
-            v_s = T.alloc_shared((block_DV,), dtype=input_dtype, scope="shared")
-            w_s = T.alloc_shared((block_DV,), dtype=input_dtype, scope="shared")
-            prod = T.alloc_shared((DK, block_DV), dtype=accum_dtype)
-            red = T.alloc_fragment((block_DV,), dtype=accum_dtype)
-            u_s = T.alloc_shared((block_DV,), dtype=accum_dtype, scope="shared")
-
-            T.copy(q[i_b, i_h, :], q_s)
-            T.copy(k[i_b, i_h, :], k_s)
-            T.copy(b[i_b, i_h, :], b_s)
-            T.copy(g[i_b, i_h, :], g_s)
-            T.copy(v[i_b, i_h, lo:hi], v_s)
-            T.copy(w[i_b, i_h, lo:hi], w_s)
-            T.copy(state[i_b, i_h, :, lo:hi], st_f)
-
-            # decay, then read out along the key axis
-            for c, d in T.Parallel(DK, block_DV):
-                st_f[c, d] = st_f[c, d] * T.exp(g_s[c])
-                prod[c, d] = st_f[c, d] * b_s[c] * k_s[c]
-            T.reduce_sum(prod, red, dim=0, clear=True)
-
-            for d in T.Parallel(block_DV):
-                u_s[d] = w_s[d] * v_s[d] - red[d]
-
-            # rank-1 write, then read the output
-            for c, d in T.Parallel(DK, block_DV):
-                st_f[c, d] = st_f[c, d] + k_s[c] * u_s[d]
-                prod[c, d] = st_f[c, d] * q_s[c] * scale
-            T.reduce_sum(prod, red, dim=0, clear=True)
-
-            T.copy(st_f, state[i_b, i_h, :, lo:hi])
-            T.copy(red, o[i_b, i_h, lo:hi])
-
-    return kernel
 
 
 _TORCH_TO_TL = {
@@ -947,46 +854,3 @@ def chunk_gdn2_fwd(
         return (*out, dict(G=G, Aqk=Aqk, Ai=Ai, W=W, U=U, KG=KG, h=h, Un=Un,
                            q=q, k=k, v=v, b=b_, w=w_, S_pad=S_pad))
     return out
-
-
-def gdn2_decode_step(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    b: torch.Tensor,
-    w: torch.Tensor,
-    state: torch.Tensor,
-    scale: float | None = None,
-) -> torch.Tensor:
-    """One autoregressive step, updating ``state`` in place.
-
-    Args:
-        q, k, b: ``[B, H, DK]``.
-        v, w: ``[B, H, DV]``.
-        g: ``[B, H, DK]`` fp32 log decay.
-        state: ``[B, H, DK, DV]``, mutated.
-        scale: query scale; defaults to ``DK ** -0.5``.
-
-    Returns:
-        ``[B, H, DV]`` output for this token.
-    """
-    
-    B, H, DK = q.shape
-    DV = v.shape[-1]
-    scale = DK**-0.5 if scale is None else scale
-
-    if q.device.type != "cuda":
-        S = state
-        S.mul_(g.float().exp().unsqueeze(-1))
-        read = torch.einsum("bhkd,bhk->bhd", S, (b * k).float())
-        u = (w * v).float() - read
-        S.add_(k.float().unsqueeze(-1) * u.unsqueeze(-2))
-        return torch.einsum("bhkd,bhk->bhd", S, q.float() * scale).to(v.dtype)
-
-    kernel = decode_step_kernel(
-        B, H, DK, DV, scale,
-        input_dtype=_tl_dtype(q.dtype), output_dtype=_tl_dtype(v.dtype),
-        state_dtype=_tl_dtype(state.dtype), block_DV=min(64, DV),
-    )
-    return kernel(q, k, v, g.float(), b, w, state)

@@ -66,13 +66,30 @@ x = torch.randn(2, 4096, 2048, device="cuda", dtype=torch.bfloat16)
 out, _ = layer(x)                       # [2, 4096, 2048]
 ```
 
-Decoding carries a state plus the short-conv window:
+### Inference
+
+Prefill reuses the chunkwise forward; decoding has its own kernels, because it
+is memory bound rather than compute bound. Each step touches the whole
+`[DK, DV]` state — 64 KiB per head at 128×128 fp32 — and does only rank-1 work
+with it, so state traffic *is* the cost.
 
 ```python
-out, cache = layer(prompt, use_cache=True)
+out, cache = layer(prompt, use_cache=True)      # prefill, chunkwise
 for _ in range(n_new):
-    tok, cache = layer.step(tok_hidden, cache)
+    tok, cache = layer.step(tok_hidden, cache)  # one token
 ```
+
+When you have several tokens at once — a speculative-decoding draft, a short
+prefill tail — pass them together. `decode_multi_kernel` keeps the state in
+registers across all `n` steps, so it is read and written **once per call
+instead of once per token**:
+
+```python
+out, cache = layer.decode(draft_hidden, cache)  # [B, n, hidden]
+```
+
+The recurrence is still sequential in `n`; what is saved is the memory traffic,
+which at `n = 8` turns 16 state round trips into 2.
 
 The functional op, if you already have projections and gates:
 
@@ -93,7 +110,7 @@ dependency — flash-linear-attention is a benchmark target, not a runtime one.
 
 | backend | forward | backward |
 | --- | --- | --- |
-| `tilelang` | 8 TileLang kernels | 8 TileLang kernels |
+| `tilelang` | 7 chunkwise + 2 decode kernels | 8 kernels |
 | `torch` | PyTorch | staged PyTorch backward |
 
 `auto` (the default) is `tilelang` on CUDA, `torch` elsewhere. The backward can
@@ -130,8 +147,10 @@ Only the state scan over chunks is sequential; everything else is batched GEMMs.
 | 6 | `state_kernel` | DV-tile × BH | sequential scan → per-chunk states, `Un` |
 | 7 | `output_kernel` | DV-tile × chunk × BH | `o` |
 
-Plus `decode_step_kernel` for single-token inference, which applies the
-recurrence directly.
+Decoding does not use these. `gdn2/inference.py` has `decode_step_kernel`
+(one token) and `decode_multi_kernel` (`n` tokens, state resident in registers),
+both applying the recurrence directly — with a handful of tokens there is no
+intra-chunk structure worth the WY machinery.
 
 Kernels 2 and 3 write disjoint column ranges of the same two matrices and must
 run in that order. All decay arithmetic is in log2 space so the kernels can use
@@ -163,7 +182,7 @@ that loses `e^-1900` per chunk.
 
 ## Status
 
-Verified on CPU (42 tests, plus 6 more when FLA is installed):
+Verified on CPU (72 tests):
 
 - the chunkwise WY form reproduces the literal recurrence to ~1e-6 relative,
   across chunk/sub-chunk sizes, with and without an initial state;
@@ -174,14 +193,15 @@ Verified on CPU (42 tests, plus 6 more when FLA is installed):
   against the recurrence, so indexing and masking mistakes in the kernel
   *design* surface without a GPU;
 - gradients match those of the literal recurrence;
-- our recurrence and our chunkwise form match FLA's official
-  `naive_recurrent_gdn2` / `naive_chunk_gdn2` to ~1e-5 (skipped if FLA is not
-  installed) — our derivation was done independently and agrees with theirs
-  term for term;
+- the backward matches autograd through the chunkwise form to ~1e-7 on every
+  gradient, including the decay;
 - reduction to KDA when the two gates are tied; zero gates leave the state to
   pure decay;
-- single-token decoding tracks the parallel forward through the layer;
-- every kernel parses to a valid TVM PrimFunc, for each `BS`/`BC` ratio.
+- decoding agrees with the parallel forward at every step size: `n` tokens at
+  once equals `n` single steps equals one forward, including the short
+  convolution's window and a draft size that does not divide the sequence;
+- all 17 kernels parse to valid TVM PrimFuncs, for each `BS`/`BC` ratio and
+  each decode length.
 
 **Not yet run on a GPU.** The algorithm is validated and every kernel parses,
 but no numerical result has come out of compiled TileLang code — the machine
@@ -243,17 +263,20 @@ Six modules, each with one job:
 | --- | --- |
 | `gdn2/config.py` | `GatedDeltaNet2Config` (what the model is) and `GDN2Config` (how the kernels run) |
 | `gdn2/attention.py` | **start here** — `gdn2_attention()` and the `GatedDeltaNet2` module |
-| `gdn2/forward.py` | 8 forward TileLang kernels + `chunk_gdn2_fwd` |
+| `gdn2/forward.py` | 7 chunkwise TileLang kernels (training + prefill) + `chunk_gdn2_fwd` |
+| `gdn2/inference.py` | decode kernels: one token, or `n` tokens per launch |
 | `gdn2/backward.py` | 8 backward TileLang kernels + `chunk_gdn2_bwd` |
 | `gdn2/reference.py` | PyTorch oracles: the recurrence, the chunkwise form, the staged backward |
 
-Dependencies run one way: `config` → `forward` → `backward` → `attention`,
-with `reference` standing alone.
+Dependencies run one way: `config` → `forward` → {`backward`, `inference`} →
+`attention`, with `reference` standing alone.
 
 | test | covers |
 | --- | --- |
 | `tests/test_gdn2.py` | maths, gate degeneracies, the module, backend selection |
 | `tests/test_backward.py` | the backward derivation, against autograd |
 | `tests/test_pipeline_simulation.py` | the forward kernel decomposition, in PyTorch |
-| `tests/test_kernel_parse.py` | all 16 kernels parse, without a GPU |
-| `bench/bench_gdn2.py` | GPU benchmark and correctness sweep |
+| `tests/test_inference.py` | decoding agrees with the parallel forward |
+| `tests/test_kernel_parse.py` | all 17 kernels parse, without a GPU |
+| `bench/bench_gdn2.py` | training/prefill benchmark |
+| `bench/bench_decode.py` | decode benchmark: state bandwidth vs tokens per launch |

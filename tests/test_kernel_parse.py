@@ -52,7 +52,6 @@ DIMS = dict(B=2, S=256, H=4, DK=64, DV=64)
         ("wy_kernel", DIMS),
         ("state_kernel", DIMS),
         ("output_kernel", dict(**DIMS, scale=0.125)),
-        ("decode_step_kernel", dict(B=2, H=4, DK=64, DV=64, scale=0.125)),
     ],
 )
 def test_kernel_parses(raw_kernels, name, kwargs):
@@ -103,6 +102,35 @@ def test_inter_blocks_rejects_single_sub_chunk(raw_kernels):
     """BC == BS leaves no off-diagonal work and would launch an empty grid."""
     with pytest.raises(ValueError, match="at least 2 sub-chunks"):
         raw_kernels.inter_blocks_kernel(B=1, S=128, H=2, DK=64, scale=0.125, chunk_size=64, sub_chunk_size=64)
+
+
+# --------------------------------------------------------------------------
+# Inference kernels
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def raw_kernels_inf():
+    """``gdn2.inference`` with ``@tilelang.jit`` neutered."""
+    original = _strip_jit()
+    sys.modules.pop("gdn2.inference", None)
+    try:
+        yield importlib.import_module("gdn2.inference")
+    finally:
+        tilelang.jit = original
+        sys.modules.pop("gdn2.inference", None)
+
+
+def test_decode_step_kernel_parses(raw_kernels_inf):
+    assert raw_kernels_inf.decode_step_kernel(B=2, H=4, DK=64, DV=64, scale=0.125).params
+
+
+@pytest.mark.parametrize("n_steps", [1, 4, 8, 16])
+def test_decode_multi_kernel_parses(raw_kernels_inf, n_steps):
+    """n_steps is compile-time, so each draft length is its own kernel."""
+    assert raw_kernels_inf.decode_multi_kernel(
+        B=2, H=4, DK=64, DV=64, n_steps=n_steps, scale=0.125
+    ).params
 
 
 # --------------------------------------------------------------------------
