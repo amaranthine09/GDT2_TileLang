@@ -1,6 +1,6 @@
-"""Backward pass: TileLang kernels and the driver that runs them.
+"""TileLang kernels for the chunkwise Gated DeltaNet-2 backward pass.
 
-Each kernel implements one stage of :mod:`gdn2.reference`, which is derived and
+Each kernel implements one stage of :mod:`gdn2.backward`, which is derived and
 checked against autograd there; read that module first, then this.
 
     1. ``dstate_kernel``      reverse scan  -> dUn, dh, dS0
@@ -25,13 +25,8 @@ is ``exp2`` of a non-positive number.
 
 import tilelang
 import tilelang.language as T
-import torch
-
-from .config import DEFAULT_KERNEL_CONFIG, GDN2Config
-from .forward import _pad_to_chunk, _tl_dtype, chunk_gdn2_fwd
 
 __all__ = [
-    "chunk_gdn2_bwd",
     "dstate_kernel",
     "dwy_a_kernel",
     "daqk_kernel",
@@ -99,7 +94,7 @@ def dstate_kernel(
         KG: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
         W: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
         q: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
-        G: T.Tensor(k_shape, dtype=gate_dtype),#type:ignore
+        G: T.Tensor(k_shape, dtype=gate_dtype), #type:ignore
         Aqk: T.Tensor(a_shape, dtype=input_dtype), #type:ignore
         dO: T.Tensor(v_shape, dtype=input_dtype), #type:ignore
         dht: T.Tensor(st_shape, dtype=state_dtype), #type:ignore
@@ -788,27 +783,27 @@ def dassemble_kernel(
 
     @T.prim_func
     def kernel(
-        q: T.Tensor(k_shape, dtype=input_dtype),
-        k: T.Tensor(k_shape, dtype=input_dtype),
-        b: T.Tensor(k_shape, dtype=input_dtype),
-        v: T.Tensor(v_shape, dtype=input_dtype),
-        w: T.Tensor(v_shape, dtype=input_dtype),
-        G: T.Tensor(k_shape, dtype=gate_dtype),
-        dE: T.Tensor(k_shape, dtype=input_dtype),
-        dEt_tm: T.Tensor(k_shape, dtype=accum_dtype),
-        dk_tm: T.Tensor(k_shape, dtype=accum_dtype),
-        dq_aqk: T.Tensor(k_shape, dtype=accum_dtype),
-        dk_aqk: T.Tensor(k_shape, dtype=accum_dtype),
-        dQg: T.Tensor(k_shape, dtype=input_dtype),
-        dKtail: T.Tensor(k_shape, dtype=input_dtype),
-        dZ: T.Tensor(v_shape, dtype=input_dtype),
-        dGC_state: T.Tensor(gc_shape, dtype=accum_dtype),
-        dq: T.Tensor(k_shape, dtype=input_dtype),
-        dk: T.Tensor(k_shape, dtype=input_dtype),
-        db: T.Tensor(k_shape, dtype=input_dtype),
-        dv: T.Tensor(v_shape, dtype=input_dtype),
-        dw: T.Tensor(v_shape, dtype=input_dtype),
-        dg: T.Tensor(k_shape, dtype=gate_dtype),
+        q: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
+        k: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
+        b: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
+        v: T.Tensor(v_shape, dtype=input_dtype), #type:ignore
+        w: T.Tensor(v_shape, dtype=input_dtype), #type:ignore
+        G: T.Tensor(k_shape, dtype=gate_dtype), #type:ignore
+        dE: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
+        dEt_tm: T.Tensor(k_shape, dtype=accum_dtype), #type:ignore
+        dk_tm: T.Tensor(k_shape, dtype=accum_dtype), #type:ignore
+        dq_aqk: T.Tensor(k_shape, dtype=accum_dtype), #type:ignore
+        dk_aqk: T.Tensor(k_shape, dtype=accum_dtype), #type:ignore
+        dQg: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
+        dKtail: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
+        dZ: T.Tensor(v_shape, dtype=input_dtype), #type:ignore
+        dGC_state: T.Tensor(gc_shape, dtype=accum_dtype), #type:ignore
+        dq: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
+        dk: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
+        db: T.Tensor(k_shape, dtype=input_dtype), #type:ignore
+        dv: T.Tensor(v_shape, dtype=input_dtype), #type:ignore
+        dw: T.Tensor(v_shape, dtype=input_dtype), #type:ignore
+        dg: T.Tensor(k_shape, dtype=gate_dtype), #type:ignore
     ):
         with T.Kernel(T.ceildiv(DK, block_DK), T.ceildiv(S, BS), B * H, threads=threads) as (i_k, i_s, i_bh):
             i_b, i_h = i_bh // H, i_bh % H
@@ -907,88 +902,3 @@ def dassemble_kernel(
                     T.copy(ov, dw[i_b, t0 : t0 + BS, i_h, vlo:vhi])
 
     return kernel
-
-
-def chunk_gdn2_bwd(
-    q, k, v, g, b, w, scale, initial_state, do, dht,
-    config: GDN2Config = DEFAULT_KERNEL_CONFIG,
-):
-    """Run the eight-kernel TileLang backward pipeline.
-
-    Mirrors :func:`gdn2.backward.chunk_gdn2_bwd_torch` stage for stage; that
-    module carries the derivation. The forward is recomputed first, because the
-    backward needs every WY intermediate and recomputing them is cheaper than
-    keeping them resident across the step.
-
-    Args:
-        q, k, v, g, b, w: forward inputs, ``[B, S, H, D]``.
-        scale: query scale.
-        initial_state: ``[B, H, DK, DV]`` or ``None``.
-        do: ``[B, S, H, DV]`` output gradient.
-        dht: ``[B, H, DK, DV]`` final-state gradient, or ``None``.
-        config: tiling configuration.
-
-    Returns:
-        ``(dq, dk, dv, dg, db, dw, dinitial_state)``.
-    """
-
-    B, S, H, DK = q.shape
-    DV = v.shape[-1]
-    BS, BC = config.chunk_size, config.sub_chunk_size
-    in_dt = _tl_dtype(q.dtype)
-    st_dt = _tl_dtype(config.state_dtype)
-
-    _, _, f = chunk_gdn2_fwd(q, k, v, g, b, w, scale, initial_state, False, config,
-                             return_intermediates=True)
-    S_pad = f["S_pad"]
-    do_p = _pad_to_chunk(do, S_pad)
-    dev, tl_kw = q.device, dict(threads=config.threads, num_stages=config.num_stages)
-    bdk, bdv = min(config.block_DK, DK), min(config.block_DV, DV)
-
-    dht_in = (dht.to(config.state_dtype).contiguous() if dht is not None
-              else torch.empty(B, H, DK, DV, dtype=config.state_dtype, device=dev))
-
-    dUn, dh, dS0 = dstate_kernel(
-        B, S_pad, H, DK, DV, scale, input_dtype=in_dt, state_dtype=st_dt,
-        chunk_size=BS, use_dht=dht is not None, block_DV=bdv, **tl_kw,
-    )(f["KG"], f["W"], f["q"], f["G"], f["Aqk"], do_p, dht_in)
-
-    dW, dKtail, dQg, dGC = dwy_a_kernel(
-        B, S_pad, H, DK, DV, input_dtype=in_dt, chunk_size=BS,
-        block_DK=bdk, block_DV=bdv, **tl_kw,
-    )(f["Un"], dUn, do_p, f["h"], dh, f["G"])
-
-    dAqk = daqk_kernel(
-        B, S_pad, H, DV, input_dtype=in_dt, chunk_size=BS, block_DV=bdv, **tl_kw,
-    )(do_p, f["Un"])
-
-    dZ, dE, dTm = dwy_b_kernel(
-        B, S_pad, H, DK, DV, input_dtype=in_dt, chunk_size=BS,
-        block_DK=bdk, block_DV=bdv, **tl_kw,
-    )(f["Ai"], dUn, dW, f["U"], f["W"])
-
-    # Kernel 5 writes the four pairwise gradients; 6 and 7 accumulate into
-    # disjoint halves of them, so they must follow it.
-    dEt_tm, dk_tm, dq_aqk, dk_aqk = dintra_diag_kernel(
-        B, S_pad, H, DK, scale, input_dtype=in_dt, chunk_size=BS, sub_chunk_size=BC,
-    )(f["q"], f["k"], f["b"], f["G"], dTm, dAqk)
-
-    dinter_row_kernel(
-        B, S_pad, H, DK, scale, input_dtype=in_dt, chunk_size=BS,
-        sub_chunk_size=BC, block_DK=min(32, DK), **tl_kw,
-    )(f["k"], f["G"], dTm, dAqk, dEt_tm, dq_aqk)
-
-    dinter_col_kernel(
-        B, S_pad, H, DK, scale, input_dtype=in_dt, chunk_size=BS,
-        sub_chunk_size=BC, block_DK=min(32, DK), **tl_kw,
-    )(f["q"], f["k"], f["b"], f["G"], dTm, dAqk, dk_tm, dk_aqk)
-
-    dq, dk, db, dv, dw, dg = dassemble_kernel(
-        B, S_pad, H, DK, DV, scale, input_dtype=in_dt, chunk_size=BS,
-        block_DK=bdk, block_DV=bdv, **tl_kw,
-    )(f["q"], f["k"], f["b"], f["v"], f["w"], f["G"], dE, dEt_tm, dk_tm,
-      dq_aqk, dk_aqk, dQg, dKtail, dZ, dGC)
-
-    trim = lambda x: x[:, :S]
-    return (*(trim(t) for t in (dq, dk, dv, dg, db, dw)),
-            dS0 if initial_state is not None else None)
