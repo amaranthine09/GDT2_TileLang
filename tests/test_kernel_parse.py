@@ -121,6 +121,11 @@ def raw_kernels_inf():
         sys.modules.pop("gdn2.inference", None)
 
 
+def test_prefill_scan_kernel_parses(raw_kernels_inf):
+    """The fused scan+output kernel that lets prefill skip storing h."""
+    assert raw_kernels_inf.prefill_scan_kernel(**DIMS, scale=0.125).params
+
+
 def test_decode_step_kernel_parses(raw_kernels_inf):
     assert raw_kernels_inf.decode_step_kernel(B=2, H=4, DK=64, DV=64, scale=0.125).params
 

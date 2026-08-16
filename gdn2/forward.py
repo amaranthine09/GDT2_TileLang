@@ -753,7 +753,7 @@ def _pad_to_chunk(x: torch.Tensor, total: int) -> torch.Tensor:
     return torch.cat([x, pad], dim=1).contiguous()
 
 
-def chunk_gdn2_fwd(
+def wy_stages(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -761,12 +761,15 @@ def chunk_gdn2_fwd(
     b: torch.Tensor,
     w: torch.Tensor,
     scale: float,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
     config: GDN2Config = DEFAULT_KERNEL_CONFIG,
-    return_intermediates: bool = False,
-):
-    """Run the seven-kernel TileLang forward pipeline.
+) -> dict:
+    """Kernels 1-5: everything before the state scan.
+
+    These stages are chunk-local and fully parallel -- they know nothing about
+    the carried state. Both the training forward and the inference prefill
+    (:func:`gdn2.inference.gdn2_prefill`) start here and differ only in what
+    they do with the scan afterwards, so this is factored out rather than
+    duplicated.
 
     Sequence lengths that are not a multiple of ``chunk_size`` are zero-padded.
     Padding is inert: ``g = 0`` leaves the decay at 1 while ``b = w = 0`` makes
@@ -779,23 +782,17 @@ def chunk_gdn2_fwd(
         b: ``[B, S, H, DK]`` erase gate.
         w: ``[B, S, H, DV]`` write gate.
         scale: query scale.
-        initial_state: ``[B, H, DK, DV]`` or ``None``.
-        output_final_state: also return the state after the last real token.
         config: tiling configuration.
-        return_intermediates: also return the tensors the backward re-uses,
-            avoiding a full recompute in ``chunk_gdn2_bwd``.
 
     Returns:
-        ``(o, final_state)``, or ``(o, final_state, intermediates)``.
+        A dict with the padded inputs and the intermediates ``G, Aqk, Ai, W,
+        U, KG``, plus ``S_pad``.
     """
-    
     B, S, H, DK = q.shape
     DV = v.shape[-1]
     BS, BC = config.chunk_size, config.sub_chunk_size
     S_pad = ((S + BS - 1) // BS) * BS
-
     in_dt = _tl_dtype(q.dtype)
-    st_dt = _tl_dtype(config.state_dtype)
 
     q, k, b_ = (_pad_to_chunk(x, S_pad) for x in (q, k, b))
     v, w_ = (_pad_to_chunk(x, S_pad) for x in (v, w))
@@ -827,6 +824,52 @@ def chunk_gdn2_fwd(
         block_DK=min(config.block_DK, DK), block_DV=min(config.block_DV, DV),
         threads=config.threads, num_stages=config.num_stages,
     )(k, v, b_, w_, G, Ai)
+
+    return dict(G=G, Aqk=Aqk, Ai=Ai, W=W, U=U, KG=KG,
+                q=q, k=k, v=v, b=b_, w=w_, S_pad=S_pad)
+
+
+def chunk_gdn2_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    b: torch.Tensor,
+    w: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    config: GDN2Config = DEFAULT_KERNEL_CONFIG,
+    return_intermediates: bool = False,
+):
+    """Run the seven-kernel TileLang forward pipeline.
+
+    This is the training forward: it stores the per-chunk states ``h`` so the
+    output kernel can run in parallel over chunks, and so the backward can
+    reuse them. For serving, :func:`gdn2.inference.gdn2_prefill` fuses the scan
+    and the output instead and never materialises ``h``.
+
+    Args:
+        q, k, v, g, b, w, scale: as in :func:`wy_stages`.
+        initial_state: ``[B, H, DK, DV]`` or ``None``.
+        output_final_state: also return the state after the last real token.
+        config: tiling configuration.
+        return_intermediates: also return the tensors the backward re-uses,
+            avoiding a full recompute in ``chunk_gdn2_bwd``.
+
+    Returns:
+        ``(o, final_state)``, or ``(o, final_state, intermediates)``.
+    """
+    B, S, H, DK = q.shape
+    DV = v.shape[-1]
+    BS = config.chunk_size
+    in_dt = _tl_dtype(q.dtype)
+    st_dt = _tl_dtype(config.state_dtype)
+
+    f = wy_stages(q, k, v, g, b, w, scale, config)
+    S_pad = f["S_pad"]
+    G, Aqk, W, U, KG = f["G"], f["Aqk"], f["W"], f["U"], f["KG"]
+    q = f["q"]
 
     if initial_state is None:
         st_in = torch.empty(B, H, DK, DV, dtype=config.state_dtype, device=q.device)

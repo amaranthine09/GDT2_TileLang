@@ -108,3 +108,123 @@ def test_decode_kernel_matches_reference(n):
 
     assert rel_err(o.float(), o_ref) < 3e-2
     assert rel_err(state, s_ref) < 3e-2
+
+
+# --------------------------------------------------------------------------
+# Prefill
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("S", [64, 128, 100, 7])
+def test_prefill_matches_recurrence(S):
+    """Includes lengths with a ragged tail, which route through decode."""
+    from gdn2 import gdn2_prefill
+
+    q, k, v, g, b, w = make_inputs(2, S, 3, 32, 24)
+    s0 = torch.randn(2, 3, 32, 24) * 0.3
+    scale = 32**-0.5
+
+    o_ref, s_ref = recurrent_gdn2(q, k, v, g, b, w, scale, s0, output_final_state=True)
+    o, state = gdn2_prefill(q, k, v, g, b, w, s0.clone(), scale)
+
+    assert o.shape == (2, S, 3, 24)
+    assert rel_err(o, o_ref) < 2e-5
+    assert rel_err(state, s_ref) < 2e-5
+
+
+def test_segmented_prefill_equals_one_pass():
+    """A long prompt fed in segments must equal prefilling it all at once."""
+    from gdn2 import gdn2_prefill
+
+    q, k, v, g, b, w = make_inputs(2, 192, 3, 32, 24)
+    scale = 32**-0.5
+
+    o_all, s_all = gdn2_prefill(q, k, v, g, b, w, None, scale)
+
+    outs, state = [], None
+    for lo, hi in ((0, 64), (64, 160), (160, 192)):
+        o, state = gdn2_prefill(*(t[:, lo:hi] for t in (q, k, v, g, b, w)), state, scale)
+        outs.append(o)
+
+    assert rel_err(torch.cat(outs, dim=1), o_all) < 2e-5
+    assert rel_err(state, s_all) < 2e-5
+
+
+def test_layer_prefill_matches_forward():
+    """prefill() and forward() differ only in plumbing, not in maths."""
+    torch.manual_seed(0)
+    cfg = GatedDeltaNet2Config(hidden_size=64, num_heads=2, head_dim_k=16, head_dim_v=16)
+    layer = GatedDeltaNet2(cfg).eval()
+    x = torch.randn(2, 70, 64)  # ragged: 70 is not a multiple of 64
+
+    with torch.no_grad():
+        full, _ = layer(x)
+        pre, _ = layer.prefill(x)
+    assert rel_err(pre, full) < 1e-4
+
+
+def test_serving_loop_matches_forward():
+    """The whole serving path end to end: prefill, then generate."""
+    torch.manual_seed(0)
+    cfg = GatedDeltaNet2Config(hidden_size=64, num_heads=2, head_dim_k=16, head_dim_v=16)
+    layer = GatedDeltaNet2(cfg).eval()
+    x = torch.randn(1, 30, 64)
+
+    with torch.no_grad():
+        full, _ = layer(x)
+        pre, cache = layer.prefill(x[:, :18])
+        draft, cache = layer.decode(x[:, 18:22], cache)
+        gen = torch.stack([layer.step(x[:, t], cache)[0] for t in range(22, 30)], dim=1)
+    assert rel_err(torch.cat([pre, draft, gen], dim=1), full) < 1e-4
+
+
+@cuda_only
+@pytest.mark.cuda
+@pytest.mark.parametrize("S", [512, 1000])
+def test_prefill_kernel_matches_reference(S):
+    """Fusing the scan into the output must not change the answer.
+
+    S=1000 has a ragged tail, so it also covers the hand-off to the decode
+    kernel at the end of a prompt.
+    """
+    from gdn2 import gdn2_prefill
+
+    q, k, v, g, b, w = make_inputs(2, S, 4, 64, 64, device="cuda")
+    s0 = torch.randn(2, 4, 64, 64, device="cuda") * 0.2
+    scale = 64**-0.5
+
+    o_ref, s_ref = recurrent_gdn2(q, k, v, g, b, w, scale, s0, output_final_state=True)
+    o, state = gdn2_prefill(q.bfloat16(), k.bfloat16(), v.bfloat16(), g,
+                            b.bfloat16(), w.bfloat16(), s0.clone(), scale)
+
+    assert rel_err(o.float(), o_ref) < 3e-2
+    assert rel_err(state, s_ref) < 3e-2
+
+
+@cuda_only
+@pytest.mark.cuda
+def test_prefill_does_not_allocate_chunk_states():
+    """The point of the fused kernel: no [B, NC, H, DK, DV] array.
+
+    Compares peak memory against the training forward, which stores it.
+    """
+    from gdn2 import chunk_gdn2_fwd, gdn2_prefill
+
+    B, S, H, DK, DV = 2, 2048, 8, 128, 128
+    q, k, v, g, b, w = make_inputs(B, S, H, DK, DV, device="cuda")
+    args = [x.bfloat16() for x in (q, k, v)] + [g] + [x.bfloat16() for x in (b, w)]
+    scale = DK**-0.5
+
+    torch.cuda.reset_peak_memory_stats()
+    chunk_gdn2_fwd(*args, scale=scale)
+    peak_train = torch.cuda.max_memory_allocated()
+
+    torch.cuda.reset_peak_memory_stats()
+    gdn2_prefill(*args, scale=scale)
+    peak_prefill = torch.cuda.max_memory_allocated()
+
+    h_bytes = B * (S // 64) * H * DK * DV * 2  # bf16 per-chunk states
+    assert peak_prefill < peak_train - h_bytes * 0.5, (
+        f"expected prefill to save ~{h_bytes / 2**20:.0f} MiB, "
+        f"got {(peak_train - peak_prefill) / 2**20:.0f} MiB"
+    )

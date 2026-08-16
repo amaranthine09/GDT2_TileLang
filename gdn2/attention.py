@@ -28,7 +28,7 @@ from torch import nn
 from .backward import chunk_gdn2_bwd
 from .config import DEFAULT_KERNEL_CONFIG, GDN2Config, GatedDeltaNet2Config
 from .forward import _pad_to_chunk, chunk_gdn2_fwd
-from .inference import gdn2_decode
+from .inference import gdn2_decode, gdn2_prefill
 from .reference import chunk_gdn2_bwd_torch, chunk_gdn2_torch
 
 __all__ = ["gdn2_attention", "GatedDeltaNet2", "GDN2Cache", "resolve_backend"]
@@ -355,6 +355,63 @@ class GatedDeltaNet2(nn.Module):
 
         new_cache = GDN2Cache(final_state, conv_state) if use_cache else None
         return out, new_cache
+
+    @torch.no_grad()
+    def prefill(
+        self, hidden_states: torch.Tensor, cache: GDN2Cache | None = None
+    ) -> tuple[torch.Tensor, GDN2Cache]:
+        """Prefill a prompt and return the cache to decode from.
+
+        Same maths as :meth:`forward`, different plumbing: no autograd graph,
+        and the state scan is fused into the output so the per-chunk states are
+        never materialised -- that array is ``[B, NC, H, DK, DV]``, hundreds of
+        MB on a long prompt, and serving has no backward to spend it on. A
+        ragged tail goes through the decode kernel instead of padding the last
+        chunk.
+
+        Pass the returned cache back in to prefill a long prompt in segments.
+
+        Args:
+            hidden_states: ``[B, S, hidden_size]``.
+            cache: cache to continue from, or ``None`` to start fresh.
+
+        Returns:
+            ``(output, cache)`` with ``output`` of shape
+            ``[B, S, hidden_size]``.
+        """
+        B, S, _ = hidden_states.shape
+        H, HK = self.num_heads, self.num_kv_heads
+        DK, DV = self.head_dim_k, self.head_dim_v
+
+        q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+        if cache is None:
+            cache = self.init_cache(B, device=hidden_states.device)
+        if self.q_conv is not None:
+            d_qk = HK * DK
+            cs = cache.conv_state
+            q, cq = self.q_conv.decode(q, cs[:, :d_qk])
+            k, ck = self.k_conv.decode(k, cs[:, d_qk : 2 * d_qk])
+            v, cv = self.v_conv.decode(v, cs[:, 2 * d_qk :])
+            cache.conv_state = torch.cat([cq, ck, cv], dim=1)
+
+        q = F.normalize(q.view(B, S, HK, DK), p=2, dim=-1)
+        k = F.normalize(k.view(B, S, HK, DK), p=2, dim=-1)
+        v = v.view(B, S, H, DV)
+        g = self._gates(hidden_states, (B, S))
+        b = torch.sigmoid(self.b_proj(hidden_states).view(B, S, HK, DK)) * self.erase_scale
+        w = torch.sigmoid(self.w_proj(hidden_states).view(B, S, H, DV))
+        q, k, b, g = (self._expand(t) for t in (q, k, b, g))
+
+        o, state = gdn2_prefill(
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            g.contiguous(), b.contiguous(), w.contiguous(),
+            cache.recurrent_state, scale=self.scale, config=self.cfg.kernel,
+        )
+        cache.recurrent_state = state
+
+        gate = self.o_gate_proj(hidden_states).view(B, S, H, DV)
+        o = self.o_norm(o, gate).reshape(B, S, H * DV)
+        return self.o_proj(o), cache
 
     @torch.no_grad()
     def decode(self, hidden_states: torch.Tensor, cache: GDN2Cache) -> tuple[torch.Tensor, GDN2Cache]:
